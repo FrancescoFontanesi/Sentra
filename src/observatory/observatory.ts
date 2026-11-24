@@ -118,8 +118,8 @@ export class UsageObservatory {
       claude: createInitialProviderSnapshot('claude', initTs),
     };
     this.signatures = {
-      codex: snapshotChangeSignature(this.snapshots.codex),
-      claude: snapshotChangeSignature(this.snapshots.claude),
+      codex: snapshotChangeSignature(this.snapshots.codex, this.claudeQuotaStaleMs),
+      claude: snapshotChangeSignature(this.snapshots.claude, this.claudeQuotaStaleMs),
     };
   }
 
@@ -286,7 +286,7 @@ export class UsageObservatory {
     nextSnap: ProviderObservatorySnapshot,
     nowMs: number
   ): void {
-    const nextSig = snapshotChangeSignature(nextSnap);
+    const nextSig = snapshotChangeSignature(nextSnap, this.claudeQuotaStaleMs);
     const changed = nextSig !== this.signatures[provider];
     this.snapshots[provider] = nextSnap;
     this.signatures[provider] = nextSig;

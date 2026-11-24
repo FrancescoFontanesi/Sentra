@@ -108,6 +108,8 @@ export interface AgenticMetrics {
   directInferenceCount: number;
   totalInferenceCount: number;
   userTurnCount?: number;
+  latestTurnId?: string;
+  latestTurnStatus?: 'started' | 'completed' | 'aborted';
   inferencesInLatestTurn?: number;
   avgInferencesPerTurn?: number;
   avgInputTokensPerInference?: number;
@@ -147,6 +149,14 @@ export interface ContextEvolution {
   contextOccupancyPercent?: number;
 }
 
+export interface BurnRateWindowSummary {
+  inputTokensPerMin?: number;
+  outputTokensPerMin?: number;
+  inferencesPerMin?: number;
+  inferencesInWindow: number;
+  windowCoverage: 'full' | 'partial' | 'unavailable';
+}
+
 export interface BurnRateMetrics {
   windowMinutes: 5;
   evaluatedAtMs: number;
@@ -159,6 +169,8 @@ export interface BurnRateMetrics {
   inferencesInWindow: number;
   windowCoverage: 'full' | 'partial' | 'unavailable';
   missingTimestampCount: number;
+  /** Non-overlapping preceding 5-minute window `(nowMs - 10m, nowMs - 5m]` on the same scope. */
+  previousWindow?: BurnRateWindowSummary;
 }
 
 export interface QuotaWindowState {
@@ -567,7 +579,7 @@ function buildContextEvolution(
   };
 }
 
-/** Deterministic 5-minute rolling burn rate over deduplicated session-wide inferences. */
+/** Deterministic 5-minute rolling burn rate (+ preceding non-overlapping 5-minute baseline) over deduplicated session-wide inferences. */
 export function computeBurnRate(
   inferences: ReadonlyArray<InferenceRecord>,
   startedAtMs: number | undefined,
@@ -601,11 +613,50 @@ export function computeBurnRate(
       inferencesInWindow: 0,
       windowCoverage: 'unavailable',
       missingTimestampCount,
+      previousWindow: { inferencesInWindow: 0, windowCoverage: 'unavailable' },
     };
   }
 
   const cutoff = nowMs - BURN_RATE_WINDOW_MS;
-  const inWindow = withTs.filter((x) => x.ts > cutoff && x.ts <= nowMs);
+  const prevCutoff = nowMs - 2 * BURN_RATE_WINDOW_MS;
+  const inWindow: Array<{ inf: InferenceRecord; ts: number }> = [];
+  const prevInWindow: Array<{ inf: InferenceRecord; ts: number }> = [];
+  for (const x of withTs) {
+    if (x.ts > cutoff && x.ts <= nowMs) inWindow.push(x);
+    else if (x.ts > prevCutoff && x.ts <= cutoff) prevInWindow.push(x);
+  }
+
+  // Compute preceding non-overlapping 5-minute window `(nowMs - 10m, nowMs - 5m]`.
+  let previousWindow: BurnRateWindowSummary;
+  const sessionExistedInPrevWindow =
+    prevInWindow.length > 0 || (startedAtMs !== undefined && startedAtMs <= cutoff);
+  if (!sessionExistedInPrevWindow) {
+    previousWindow = { inferencesInWindow: 0, windowCoverage: 'unavailable' };
+  } else if (prevInWindow.length === 0) {
+    const prevPartial =
+      (startedAtMs !== undefined && startedAtMs > prevCutoff) || missingTimestampCount > 0;
+    previousWindow = {
+      ...(sessionHasInput ? { inputTokensPerMin: 0 } : {}),
+      ...(sessionHasOutput ? { outputTokensPerMin: 0 } : {}),
+      inferencesPerMin: 0,
+      inferencesInWindow: 0,
+      windowCoverage: prevPartial ? 'partial' : 'full',
+    };
+  } else {
+    let pIn = 0, pInCnt = 0, pOut = 0, pOutCnt = 0, pPartial = false;
+    for (const { inf } of prevInWindow) {
+      if (inf.tokens.totalInputTokens !== undefined) { pIn += inf.tokens.totalInputTokens; pInCnt += 1; } else pPartial = true;
+      if (inf.tokens.outputTokens !== undefined) { pOut += inf.tokens.outputTokens; pOutCnt += 1; } else pPartial = true;
+    }
+    const prevShort = startedAtMs !== undefined && startedAtMs > prevCutoff;
+    previousWindow = {
+      ...(pInCnt > 0 ? { inputTokensPerMin: pIn / windowMinutes } : {}),
+      ...(pOutCnt > 0 ? { outputTokensPerMin: pOut / windowMinutes } : {}),
+      inferencesPerMin: prevInWindow.length / windowMinutes,
+      inferencesInWindow: prevInWindow.length,
+      windowCoverage: prevShort || missingTimestampCount > 0 || pPartial ? 'partial' : 'full',
+    };
+  }
 
   let sumInput = 0, cntInput = 0;
   let sumRead = 0, cntRead = 0;
@@ -645,6 +696,7 @@ export function computeBurnRate(
       inferencesInWindow: 0,
       windowCoverage,
       missingTimestampCount,
+      previousWindow,
     };
   }
 
@@ -660,6 +712,7 @@ export function computeBurnRate(
     inferencesInWindow: inWindow.length,
     windowCoverage,
     missingTimestampCount,
+    previousWindow,
   };
 }
 
@@ -1058,7 +1111,7 @@ export function computeProviderMetrics(
   const associatedCount = turnByInfId.size;
   const latestTurn = turns.length > 0 ? turns[turns.length - 1] : undefined;
   const inferencesInLatestTurn =
-    latestTurn && (associatedCount > 0 || direct.length === 0)
+    latestTurn && (associatedCount > 0 || direct.length === 0 || latestTurn.status !== undefined)
       ? (countByTurnId.get(latestTurn.id) ?? 0)
       : undefined;
   const avgInferencesPerTurn =
@@ -1209,6 +1262,8 @@ export function computeProviderMetrics(
       directInferenceCount: direct.length,
       totalInferenceCount: total.length,
       ...(userTurnCount !== undefined ? { userTurnCount } : {}),
+      ...(latestTurn !== undefined ? { latestTurnId: latestTurn.id } : {}),
+      ...(latestTurn?.status !== undefined ? { latestTurnStatus: latestTurn.status } : {}),
       ...(inferencesInLatestTurn !== undefined ? { inferencesInLatestTurn } : {}),
       ...(avgInferencesPerTurn !== undefined ? { avgInferencesPerTurn } : {}),
       ...(directInputCnt > 0 ? { avgInputTokensPerInference: directInputSum / directInputCnt } : {}),
@@ -1236,16 +1291,29 @@ export function updateTimeDependentMetrics(
   const canonicalSessionId = selection.sessionId ? `${prev.provider}:${selection.sessionId}` : undefined;
   const primarySession = canonicalSessionId ? state.sessions[canonicalSessionId] : undefined;
 
-  // Skip scanning inferences once burn rate has settled at 0 and short-session partial window has elapsed.
-  const shortSessionElapsed =
+  // Skip scanning inferences once BOTH current and previous 5-min windows have settled at 0 and short-session transitions elapsed.
+  const prevWin = prev.burnRate.previousWindow;
+  const startedAtMs = prev.identity.startedAtMs;
+  const shortCurrentElapsed =
     prev.burnRate.windowCoverage === 'partial' &&
     prev.burnRate.missingTimestampCount === 0 &&
-    prev.identity.startedAtMs !== undefined &&
-    nowMs - prev.identity.startedAtMs >= BURN_RATE_WINDOW_MS;
+    startedAtMs !== undefined &&
+    nowMs - startedAtMs >= BURN_RATE_WINDOW_MS;
+  const shortPrevTransition =
+    prev.burnRate.windowCoverage !== 'unavailable' &&
+    startedAtMs !== undefined &&
+    prev.burnRate.missingTimestampCount === 0 &&
+    ((prevWin?.windowCoverage === 'unavailable' && nowMs - startedAtMs >= BURN_RATE_WINDOW_MS) ||
+      (prevWin?.windowCoverage === 'partial' && nowMs - startedAtMs >= 2 * BURN_RATE_WINDOW_MS));
   let burnRate = prev.burnRate;
-  if (prev.burnRate.inferencesInWindow > 0 || shortSessionElapsed) {
+  if (
+    prev.burnRate.inferencesInWindow > 0 ||
+    (prevWin?.inferencesInWindow ?? 0) > 0 ||
+    shortCurrentElapsed ||
+    shortPrevTransition
+  ) {
     const { total } = collectSessionInferences(state, primarySession);
-    burnRate = computeBurnRate(total, prev.identity.startedAtMs, nowMs);
+    burnRate = computeBurnRate(total, startedAtMs, nowMs);
   } else {
     burnRate = { ...prev.burnRate, evaluatedAtMs: nowMs };
   }
@@ -1343,6 +1411,7 @@ export function createInitialProviderSnapshot(provider: ProviderId, nowMs: numbe
       inferencesInWindow: 0,
       windowCoverage: 'unavailable',
       missingTimestampCount: 0,
+      previousWindow: { inferencesInWindow: 0, windowCoverage: 'unavailable' },
     },
     subscription: {
       provider,
@@ -1354,8 +1423,12 @@ export function createInitialProviderSnapshot(provider: ProviderId, nowMs: numbe
 }
 
 /** Meaningful-change signature ignoring pure wall-clock ticks (`updatedAtMs`, `evaluatedAtMs`, `ageMs`). */
-export function snapshotChangeSignature(s: ProviderObservatorySnapshot): string {
+export function snapshotChangeSignature(
+  s: ProviderObservatorySnapshot,
+  quotaFreshnessMs: number = DEFAULT_CLAUDE_QUOTA_STALE_MS
+): string {
   const b = s.burnRate;
+  const bp = b.previousWindow;
   const sub = s.subscription;
   return JSON.stringify({
     st: s.identity.status,
@@ -1371,8 +1444,18 @@ export function snapshotChangeSignature(s: ProviderObservatorySnapshot): string 
     err: s.identity.lastError,
     cov: [s.coverage.level, s.coverage.inferencesTotal, s.coverage.inferencesWithConflicts, s.coverage.hasSnapshotDiscrepancy],
     tot: [s.usage.direct.totalTokens, s.usage.subagents.totalTokens, s.usage.total.totalTokens, s.usage.harnessSnapshot?.totalTokens?.totalTokens, s.usage.harnessSnapshot?.totalCostUSD],
-    ctx: [s.context.series.length, s.context.currentContextTokens, s.context.compactions.length],
-    br: [b.windowCoverage, b.inferencesInWindow, b.inferencesPerMin, b.inputTokensPerMin, b.cacheReadTokensPerMin, b.cacheWriteTokensPerMin, b.outputTokensPerMin],
+    ag: [s.agentic.userTurnCount, s.agentic.latestTurnId, s.agentic.latestTurnStatus, s.agentic.inferencesInLatestTurn, s.agentic.subagentCount],
+    ctx: [
+      s.context.series.length,
+      s.context.currentContextTokens,
+      s.context.isCurrentContextFromLatestInference,
+      s.context.contextWindowTokens,
+      s.context.compactions.length,
+    ],
+    br: [
+      b.windowCoverage, b.inferencesInWindow, b.inferencesPerMin, b.inputTokensPerMin, b.cacheReadTokensPerMin, b.cacheWriteTokensPerMin, b.outputTokensPerMin,
+      bp?.windowCoverage, bp?.inferencesInWindow, bp?.inputTokensPerMin, bp?.outputTokensPerMin,
+    ],
     sub: [
       sub.freshness,
       sub.cached?.fetchedAtMs,
@@ -1380,7 +1463,15 @@ export function snapshotChangeSignature(s: ProviderObservatorySnapshot): string 
       sub.cached?.windows.map((w) => [w.windowId, w.usedPercent, w.resetPassedWithoutNewObservation]),
       sub.rateLimitStatus?.status,
       sub.rateLimitStatus?.resetPassedWithoutNewObservation,
-      sub.categories?.map((c) => [c.categoryKey, c.windows.map((w) => [w.windowId, w.usedPercent, w.resetPassedWithoutNewObservation])]),
+      sub.categories?.map((c) => [
+        c.categoryKey,
+        c.windows.map((w) => [
+          w.windowId,
+          w.usedPercent,
+          w.resetPassedWithoutNewObservation,
+          w.ageMs !== undefined && w.ageMs > quotaFreshnessMs,
+        ]),
+      ]),
     ],
   });
 }
