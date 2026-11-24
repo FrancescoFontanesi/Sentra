@@ -1,0 +1,38 @@
+{
+  "name": "sentra",
+  "displayName": "Sentra",
+  "description": "Local, passive usage monitoring (Usage Observatory) and deterministic configuration auditing (Harness Auditor) for Codex and Claude Code.",
+  "version": "0.0.1",
+  "publisher": "sentra-local",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "type": "commonjs",
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sentra.verifyInstallation",
+        "title": "Sentra: Verify Installation"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "npm run build && node --test \"out/test/**/*.test.js\"",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/vscode": "1.101.0",
+    "@vscode/vsce": "^4.1.1",
+    "typescript": "^5.9.3"
+  }
+}
