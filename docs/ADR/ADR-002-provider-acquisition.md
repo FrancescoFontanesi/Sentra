@@ -225,7 +225,8 @@ Stack `node:test` + `node:assert/strict` (ADR-001), eseguibile integralmente fuo
 
 - `zlib.createZstdDecompress` è etichettato *Stability 1 (Experimental)* in Node `22.15.x` (VS Code `1.101.0`) prima della stabilizzazione in Node `24.x`; se mai emergessero regressioni su una specifica build Electron di VS Code `1.101.x`, sarà possibile inserire `fzstd` dietro la stessa interfaccia di `jsonl-reader.ts`.
 - Su Windows `fs.watch` non garantisce la consegna di ogni singolo evento in caso di raffiche rapide; la riconciliazione periodica leggera colma il gap con latenza massima pari all'intervallo di riconciliazione.
-- I cursori in memoria di ADR-002 non sopravvivono al riavvio dell'estensione: la persistenza su disco appartiene ad ADR-003.
+- I cursori di `SourceCursorStore` risiedono in memoria; come definito dalla correzione di scope di ADR-003, il flusso ordinario dell'Observatory acquisisce solo la sessione corrente per provider, mentre l'acquisizione storica completa (`acquireCodex` / `acquireClaude`) rimane disponibile on demand (es. per analisi mirate del futuro Harness Auditor).
+- Nei rollout subagent Codex che condividono `payload.session_id` con il thread padre, `src/providers/codex/parser.ts` utilizza `payload.id` (`threadId`) come identificativo di sessione del subagent così da preservarne la distinzione dal padre.
 - La quota Claude Code da `~/.claude.json` (`cachedUsageUtilization`) riflette l'ultimo fetch registrato da Claude Code (`fetchedAtMs`) e può risultare stantia rispetto allo stato corrente del servizio.
 - I rollout Codex legacy (es. `0.45.0-alpha.5`) privi di `token_usage_record` espongono solo `event_msg/token_count`; l'eventuale ricostruzione del consumo puntuale è demandata ad ADR-003.
 

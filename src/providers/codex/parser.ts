@@ -106,7 +106,9 @@ export function parseCodexRolloutRecord(
   if (topType === 'session_meta' && p) {
     const cliVersion = asStr(p.cli_version);
     const id = asStr(p.id);
-    const sessionId = asStr(p.session_id) ?? id;
+    const parentThreadId = asStr(p.parent_thread_id);
+    // Keep subagent thread identity distinct when Codex shares parent's `session_id`.
+    const sessionId = parentThreadId && id ? id : (asStr(p.session_id) ?? id);
     if (cliVersion) ctx.harnessVersion = cliVersion;
     if (sessionId) ctx.sessionId = sessionId;
     const git = asObj(p.git);
