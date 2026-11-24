@@ -125,6 +125,13 @@ export function parseClaudeTranscriptRecord(
 
   if (rawType === 'user') {
     const mcpMeta = asObj(rec.mcpMeta);
+    const msgContent = asObj(rec.message)?.content;
+    // Flag tool-result user frames as a boolean without ever capturing toolUseResult payloads.
+    const isToolResult =
+      rec.toolUseResult !== undefined ||
+      (Array.isArray(msgContent) &&
+        msgContent.length > 0 &&
+        msgContent.every((b) => asObj(b)?.type === 'tool_result'));
     return {
       observations: [makeObs(
         'lifecycle', 'user',
@@ -132,7 +139,12 @@ export function parseClaudeTranscriptRecord(
           sessionId, agentId, uuid: asStr(rec.uuid), parentUuid: asStr(rec.parentUuid),
           turnPromptId: asStr(rec.turnPromptId), promptId: asStr(rec.promptId), toolUseId: asStr(rec.sourceToolUseID),
         },
-        { kind: 'user_turn', ...pick(rec, USER_KEYS), ...(mcpMeta ? { mcpMetaKeys: Object.keys(mcpMeta).sort() } : {}) }
+        {
+          kind: 'user_turn',
+          ...pick(rec, USER_KEYS),
+          ...(isToolResult ? { isToolResult: true } : {}),
+          ...(mcpMeta ? { mcpMetaKeys: Object.keys(mcpMeta).sort() } : {}),
+        }
       )],
       diagnostics: [],
     };

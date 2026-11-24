@@ -51,11 +51,11 @@ test('Codex monitor selects workspace primary session (never subagent), reconstr
       now - 5_000
     );
 
-    // Subagent rollout is NEWER than main rollout, but MUST NOT replace `sess-A` as primary target.
+    // Subagent rollout is NEWER than main rollout, shares parent `session_id` on token_usage_record, and MUST NOT replace `sess-A` or merge into parent direct inferences.
     writeWithMtime(
       path.join(day, 'rollout-sub-1.jsonl'),
-      '{"timestamp":"2026-11-24T10:06:00Z","type":"session_meta","payload":{"id":"sub-1","parent_thread_id":"sess-A","agent_role":"worker","cwd":"F:\\\\Work\\\\Sentra"}}\n' +
-      '{"timestamp":"2026-11-24T10:06:01Z","type":"token_usage_record","payload":{"session_id":"sub-1","response_id":"resp-sub1","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20,"total_tokens":120}}}\n',
+      '{"timestamp":"2026-11-24T10:06:00Z","type":"session_meta","payload":{"id":"sub-1","session_id":"sess-A","parent_thread_id":"sess-A","agent_role":"worker","cwd":"F:\\\\Work\\\\Sentra"}}\n' +
+      '{"timestamp":"2026-11-24T10:06:01Z","type":"token_usage_record","payload":{"session_id":"sess-A","thread_id":"sub-1","response_id":"resp-sub1","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":20,"total_tokens":120}}}\n',
       now - 1_000
     );
 
@@ -77,6 +77,8 @@ test('Codex monitor selects workspace primary session (never subagent), reconstr
     assert.equal(monitor.currentState.sessions['codex:sess-A']?.isSubagent, false);
     assert.equal(monitor.currentState.sessions['codex:sub-1']?.isSubagent, true);
     assert.deepEqual(monitor.currentState.sessions['codex:sess-A']?.childSessionIds, ['codex:sub-1']);
+    assert.deepEqual(monitor.currentState.sessions['codex:sub-1']?.directInferenceIds, ['codex:resp:resp-sub1']);
+    assert.equal(monitor.currentState.sessions['codex:sess-A']?.directInferenceIds.includes('codex:resp:resp-sub1'), false);
 
     // Incremental append on active rollout reads only the new line.
     const appendedLine =
@@ -176,13 +178,18 @@ test('Claude monitor prioritizes runtime session + workspace, isolates subagents
     const r1 = await monitor.refresh();
     assert.equal(r1.selection.sessionId, 'c-1');
     assert.equal(r1.selection.reason, 'runtime_workspace');
-    assert.equal(r1.filesRead, 3); // c-1.jsonl + agent-s1.jsonl + .claude.json (NOT old-c.jsonl!)
+    assert.equal(r1.filesRead, 4); // c-1.jsonl + agent-s1.jsonl + <pid>.json + .claude.json (NOT old-c.jsonl!)
     assert.equal(monitor.currentState.inferences['claude:msg:m-old'], undefined);
     assert.ok(monitor.currentState.inferences['claude:msg:m-c1']);
     assert.ok(monitor.currentState.inferences['claude:msg:m-sub']);
     assert.equal(monitor.currentState.sessions['claude:c-1']?.isSubagent, false);
     assert.equal(monitor.currentState.sessions['claude:c-1:agent:s1']?.isSubagent, true);
     assert.ok(monitor.currentState.latestQuotaByCategory['claude:cached_utilization']);
+    assert.ok(
+      Object.values(monitor.currentState.lifecycleEvents).some(
+        (ev) => ev.kind === 'runtime_session' && ev.sessionId === 'claude:c-1' && ev.details.status === 'running'
+      )
+    );
 
     // Two active runtime sessions in the same workspace -> ambiguity explicitly preserved.
     writeWithMtime(

@@ -10,7 +10,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "type": "commonjs",
   "main": "./out/src/extension.js",
   "contributes": {

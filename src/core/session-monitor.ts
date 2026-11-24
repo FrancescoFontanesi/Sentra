@@ -66,12 +66,19 @@ export interface SessionRefreshResult {
   diagnostics: DiagnosticEvent[];
 }
 
-interface CodexHeaderMeta {
+export interface CodexHeaderMeta {
   sessionId?: string;
   threadId?: string;
   parentThreadId?: string;
   isSubagent: boolean;
   cwd?: string;
+}
+
+export interface CodexHeaderCacheEntry {
+  mtimeMs: number;
+  size: number;
+  ino: bigint;
+  meta?: CodexHeaderMeta;
 }
 
 const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
@@ -191,12 +198,17 @@ function parseCodexHeader(hdr: JsonObject | undefined): CodexHeaderMeta | undefi
   };
 }
 
-async function statMtime(filePath: string): Promise<number> {
+async function statMeta(filePath: string): Promise<{ mtimeMs: number; size: number; ino: bigint }> {
   try {
-    return (await fs.promises.stat(filePath)).mtimeMs;
+    const st = await fs.promises.stat(filePath, { bigint: true });
+    return { mtimeMs: Number(st.mtimeMs), size: Number(st.size), ino: st.ino };
   } catch {
-    return 0;
+    return { mtimeMs: 0, size: 0, ino: 0n };
   }
+}
+
+async function statMtime(filePath: string): Promise<number> {
+  return (await statMeta(filePath)).mtimeMs;
 }
 
 /**
@@ -204,24 +216,49 @@ async function statMtime(filePath: string): Promise<number> {
  * prioritizes active uncompressed rollouts + workspace match, never choosing a subagent as primary target.
  */
 export async function selectCodexSession(
-  options: CodexDiscoveryOptions & { workspace?: string; nowMs?: number } = {}
+  options: CodexDiscoveryOptions & {
+    workspace?: string;
+    nowMs?: number;
+    headerCache?: Map<string, CodexHeaderCacheEntry>;
+  } = {}
 ): Promise<SessionSelection> {
   const nowMs = options.nowMs ?? Date.now();
   const discovered = (await discoverCodexSources({ ...options, mode: 'incremental' })).filter(
     (s) => s.kind === 'rollout'
   );
   if (discovered.length === 0) {
+    options.headerCache?.clear();
     return { provider: 'codex', reason: 'none', ambiguous: false, candidates: [], sources: [] };
   }
 
-  const ranked = await Promise.all(discovered.map(async (s) => ({ s, mtimeMs: await statMtime(s.path) })));
+  const ranked = await Promise.all(
+    discovered.map(async (s) => {
+      const st = await statMeta(s.path);
+      return { s, mtimeMs: st.mtimeMs, size: st.size, ino: st.ino };
+    })
+  );
   ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-  // Peek headers only for the most recent rollouts to find primary sessions & associated segments/subagents.
+  // Prune header cache entries for removed rollouts so memory stays bounded.
+  if (options.headerCache) {
+    const livePaths = new Set(discovered.map((s) => s.path));
+    for (const k of options.headerCache.keys()) {
+      if (!livePaths.has(k)) options.headerCache.delete(k);
+    }
+  }
+
+  // Peek headers only for the most recent rollouts (reusing cached metadata when unchanged).
   const inspected: Array<{ s: DiscoveredSource; mtimeMs: number; meta?: CodexHeaderMeta }> = [];
   for (const item of ranked.slice(0, CODEX_HEADER_PEEK_LIMIT)) {
-    const meta = parseCodexHeader(await peekFirstJsonlLine(item.s.path));
-    inspected.push({ ...item, meta });
+    const cached = options.headerCache?.get(item.s.path);
+    let meta: CodexHeaderMeta | undefined;
+    if (cached && cached.mtimeMs === item.mtimeMs && cached.size === item.size && cached.ino === item.ino) {
+      meta = cached.meta;
+    } else {
+      meta = parseCodexHeader(await peekFirstJsonlLine(item.s.path));
+      options.headerCache?.set(item.s.path, { mtimeMs: item.mtimeMs, size: item.size, ino: item.ino, meta });
+    }
+    inspected.push({ s: item.s, mtimeMs: item.mtimeMs, meta });
   }
 
   const primaryBySession = new Map<string, SessionCandidate & { active: boolean; workspaceMatch: boolean }>();
@@ -329,7 +366,14 @@ export async function selectClaudeSession(
   const discovered = await discoverClaudeSources(options);
   const mainTranscripts = discovered.filter((s) => s.kind === 'transcript');
   if (mainTranscripts.length === 0) {
-    return { provider: 'claude', reason: 'none', ambiguous: false, candidates: [], sources: [] };
+    // Provider-scoped cached quota remains observable even before any Claude session transcript exists.
+    return {
+      provider: 'claude',
+      reason: 'none',
+      ambiguous: false,
+      candidates: [],
+      sources: discovered.filter((s) => s.kind === 'claude_json_usage'),
+    };
   }
 
   const transcriptById = new Map<string, { s: DiscoveredSource; mtimeMs: number }>();
@@ -345,6 +389,7 @@ export async function selectClaudeSession(
 
   // 1. Inspect runtime `sessions/<pid>.json` files.
   const activeRuntime: Array<SessionCandidate & { workspaceMatch: boolean }> = [];
+  const runtimePathsBySession = new Map<string, Set<string>>();
   const checkPid = options.checkPidLiveness ?? true;
   for (const rs of discovered.filter((s) => s.kind === 'runtime_session')) {
     try {
@@ -353,6 +398,12 @@ export async function selectClaudeSession(
       const pid = asNum(data?.pid);
       if (!sid) continue;
       if (checkPid && pid !== undefined && !isProcessAlive(pid)) continue;
+      let pathSet = runtimePathsBySession.get(sid);
+      if (!pathSet) {
+        pathSet = new Set();
+        runtimePathsBySession.set(sid, pathSet);
+      }
+      pathSet.add(rs.path);
       const cwd = asStr(data?.cwd);
       const updated = asNum(data?.updatedAt) ?? asNum(data?.statusUpdatedAt) ?? (await statMtime(rs.path));
       const t = transcriptById.get(sid);
@@ -408,10 +459,12 @@ export async function selectClaudeSession(
 
   // Gather ONLY the chosen session's transcript, its own subagents, its runtime json, and provider quota.
   const subPrefix = `/${chosen.sessionId}/`;
+  const chosenRuntimePaths = runtimePathsBySession.get(chosen.sessionId);
   const chosenSources = discovered.filter(
     (s) =>
       (s.kind === 'transcript' && path.basename(s.path, '.jsonl') === chosen.sessionId) ||
       ((s.kind === 'subagent_transcript' || s.kind === 'subagent_meta') && s.logicalKey.includes(subPrefix)) ||
+      (s.kind === 'runtime_session' && Boolean(chosenRuntimePaths?.has(s.path))) ||
       s.kind === 'claude_json_usage'
   );
 
@@ -435,6 +488,8 @@ export class ProviderSessionMonitor {
   private state: SentraState = createEmptyState();
   private cursors = new SourceCursorStore();
   private currentSelection?: SessionSelection;
+  private readonly codexHeaderCache = new Map<string, CodexHeaderCacheEntry>();
+  private workspace?: string;
 
   constructor(
     public readonly provider: ProviderId,
@@ -443,7 +498,9 @@ export class ProviderSessionMonitor {
       checkPidLiveness?: boolean;
       nowMs?: () => number;
     } = {}
-  ) {}
+  ) {
+    this.workspace = options.workspace;
+  }
 
   get currentState(): SentraState {
     return this.state;
@@ -453,14 +510,27 @@ export class ProviderSessionMonitor {
     return this.currentSelection;
   }
 
+  get targetWorkspace(): string | undefined {
+    return this.workspace;
+  }
+
+  setWorkspace(workspace?: string): void {
+    this.workspace = workspace;
+  }
+
   async refresh(): Promise<SessionRefreshResult> {
     const selection =
       this.provider === 'codex'
-        ? await selectCodexSession({ ...this.options, nowMs: this.options.nowMs?.() })
-        : await selectClaudeSession(this.options);
+        ? await selectCodexSession({
+            ...this.options,
+            workspace: this.workspace,
+            nowMs: this.options.nowMs?.(),
+            headerCache: this.codexHeaderCache,
+          })
+        : await selectClaudeSession({ ...this.options, workspace: this.workspace });
 
     const prevId = this.currentSelection?.sessionId;
-    const switched = Boolean(selection.sessionId && prevId && selection.sessionId !== prevId);
+    const switched = Boolean(prevId && selection.sessionId !== prevId);
 
     if (switched) {
       // Drop previous session state while preserving provider/account-scoped quota history.
@@ -507,8 +577,12 @@ export class ProviderSessionMonitor {
       }
 
       const prevOffset = this.cursors.getByLogicalKey(source.logicalKey)?.byteOffset ?? 0;
+      const cachedHdr = this.provider === 'codex' ? this.codexHeaderCache.get(source.path)?.meta : undefined;
       const codexCtx: CodexParseContext = {
-        sessionId: selection.sessionId,
+        sessionId: cachedHdr?.isSubagent
+          ? (cachedHdr.threadId ?? cachedHdr.sessionId ?? selection.sessionId)
+          : (cachedHdr?.sessionId ?? selection.sessionId),
+        parentThreadId: cachedHdr?.parentThreadId,
         harnessVersion: activeSession?.harnessVersion,
       };
       const claudeSubCtx =

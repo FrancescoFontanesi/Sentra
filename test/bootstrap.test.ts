@@ -40,8 +40,8 @@ test('compiled entry point declared in manifest exists', () => {
   assert.equal(fs.existsSync(entryPoint), true, `Missing entry point: ${entryPoint}`);
 });
 
-test('verify installation command is declared with implicit activation', () => {
-  assert.deepEqual(manifest.activationEvents, []);
+test('verify installation command is declared with onStartupFinished activation', () => {
+  assert.deepEqual(manifest.activationEvents, ['onStartupFinished']);
   const commands = manifest.contributes?.commands ?? [];
   assert.deepEqual(commands, [
     {

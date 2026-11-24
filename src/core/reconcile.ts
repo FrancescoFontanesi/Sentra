@@ -466,10 +466,22 @@ function reconcileLifecycle(
   }
 
   if (obs.eventType === 'user' && session) {
-    const turnId = obs.nativeIds.turnPromptId ?? obs.nativeIds.uuid;
-    if (turnId) {
-      const t = ensureTurn(state, 'claude', session.id, turnId, obs.source.logicalKey);
-      t.startedAt = earlierTs(t.startedAt, obs.timestamp);
+    // Only record real user-originated prompts as TurnRecords (exclude tool results, meta, compact summaries, system/peer notices).
+    const origin = asStr(p.turnOrigin);
+    const isNonHumanUser =
+      p.isToolResult === true ||
+      p.isMeta === true ||
+      p.isCompactSummary === true ||
+      asStr(p.promptSource) === 'system' ||
+      origin === 'task_notification' ||
+      origin === 'peer' ||
+      origin === 'system';
+    if (!isNonHumanUser) {
+      const turnId = obs.nativeIds.turnPromptId ?? obs.nativeIds.uuid;
+      if (turnId) {
+        const t = ensureTurn(state, 'claude', session.id, turnId, obs.source.logicalKey);
+        t.startedAt = earlierTs(t.startedAt, obs.timestamp);
+      }
     }
   } else if (obs.eventType === 'derived-from' && session) {
     const derivedIds: string[] = [];
@@ -715,6 +727,21 @@ export function reconcileObservations(
     quotaIndex: new Map(),
     latestFingerprints: new Map(),
   };
+
+  // Seed incremental model & contextWindow from existing state so appended Codex inferences keep context across batches.
+  for (const s of Object.values(state.sessions)) {
+    if (s.primaryModel) scratch.latestTurnModel.set(s.id, s.primaryModel);
+  }
+  for (const snap of Object.values(state.usageSnapshots)) {
+    if (snap.sessionId && snap.modelContextWindow !== undefined) {
+      scratch.latestContextWindow.set(snap.sessionId, snap.modelContextWindow);
+    }
+  }
+  for (const inf of Object.values(state.inferences)) {
+    if (inf.ownerSessionId && inf.tokens.contextWindow !== undefined && !scratch.latestContextWindow.has(inf.ownerSessionId)) {
+      scratch.latestContextWindow.set(inf.ownerSessionId, inf.tokens.contextWindow);
+    }
+  }
 
   for (const q of state.quotaSnapshots) {
     const k = `${q.categoryKey}|${quotaFingerprint(q.limitId, q.limitName, q.planType, q.windows)}`;

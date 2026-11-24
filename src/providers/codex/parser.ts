@@ -15,6 +15,7 @@ import {
 export interface CodexParseContext {
   harnessVersion?: string;
   sessionId?: string;
+  parentThreadId?: string;
 }
 
 export interface CodexParseResult {
@@ -111,6 +112,7 @@ export function parseCodexRolloutRecord(
     const sessionId = parentThreadId && id ? id : (asStr(p.session_id) ?? id);
     if (cliVersion) ctx.harnessVersion = cliVersion;
     if (sessionId) ctx.sessionId = sessionId;
+    if (parentThreadId) ctx.parentThreadId = parentThreadId;
     const git = asObj(p.git);
     return emit(
       'lifecycle', 'session_meta',
@@ -132,11 +134,18 @@ export function parseCodexRolloutRecord(
     const usage = pickNums(p.usage, USAGE_KEYS);
     const turnUsage = pickNums(p.turn_token_usage, USAGE_KEYS);
     const threadUsage = pickNums(p.thread_token_usage, USAGE_KEYS);
+    const rawSessionId = asStr(p.session_id);
+    const threadId = asStr(p.thread_id);
+    // On Codex subagent rollouts, `payload.session_id` carries the parent ID while `payload.thread_id` is the subagent.
+    const inferredParent =
+      ctx.parentThreadId ?? (rawSessionId && threadId && rawSessionId !== threadId ? rawSessionId : undefined);
+    const sessionId = inferredParent ? (threadId ?? ctx.sessionId) : (rawSessionId ?? ctx.sessionId);
     return emit(
       'usage_point', 'token_usage_record',
       {
-        sessionId: asStr(p.session_id) ?? ctx.sessionId,
-        threadId: asStr(p.thread_id),
+        sessionId,
+        threadId,
+        parentThreadId: inferredParent,
         turnId: asStr(p.turn_id),
         rootTurnId: asStr(p.root_turn_id),
         responseId: asStr(p.response_id),
