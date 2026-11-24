@@ -1,0 +1,3 @@
+{"timestamp":"2025-10-01T08:00:00.000Z","type":"session_meta","payload":{"id":"thr-legacy","cli_version":"0.45.0-alpha.5","cwd":"C:\\Work\\Legacy"}}
+{"timestamp":"2025-10-01T08:00:02.000Z","type":"turn_context","payload":{"model":"o3-mini","cwd":"C:\\Work\\Legacy"}}
+{"timestamp":"2025-10-01T08:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":200,"total_tokens":700},"total_token_usage":{"input_tokens":500,"output_tokens":200,"total_tokens":700},"model_context_window":200000}}}
